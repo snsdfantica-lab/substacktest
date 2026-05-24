@@ -1,0 +1,66 @@
+"""Tracks which post URLs have already been summarized, and caches per-article
+text + summaries on disk so we can show 'change-in-tone' context across runs."""
+
+from __future__ import annotations
+
+import json
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SEEN_PATH = ROOT / "state" / "seen.json"
+CACHE_DIR = ROOT / "state" / "cache"
+
+
+def load_seen() -> dict[str, dict]:
+    """Return {post_url: {author, title, summarized_at}}."""
+    if not SEEN_PATH.exists():
+        return {}
+    return json.loads(SEEN_PATH.read_text() or "{}")
+
+
+def save_seen(seen: dict[str, dict]) -> None:
+    SEEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    SEEN_PATH.write_text(json.dumps(seen, indent=2, sort_keys=True) + "\n")
+
+
+def mark_seen(seen: dict[str, dict], post_url: str, author: str, title: str) -> None:
+    seen[post_url] = {
+        "author": author,
+        "title": title,
+        "summarized_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _slugify(s: str) -> str:
+    s = re.sub(r"[^a-zA-Z0-9._-]+", "-", s)
+    return s.strip("-")[:120] or "untitled"
+
+
+def cache_path(author: str, post_url: str) -> Path:
+    folder = CACHE_DIR / _slugify(author)
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{_slugify(post_url)}.json"
+
+
+def write_cache(author: str, post_url: str, payload: dict) -> None:
+    p = cache_path(author, post_url)
+    p.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_recent_summaries(author: str, limit: int = 5) -> list[dict]:
+    """Return the most-recent N cached entries for an author, newest first.
+    Each entry is the payload previously written by write_cache."""
+    folder = CACHE_DIR / _slugify(author)
+    if not folder.exists():
+        return []
+    entries: list[tuple[str, dict]] = []
+    for p in folder.glob("*.json"):
+        try:
+            data = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            continue
+        entries.append((data.get("published_at") or data.get("summarized_at") or "", data))
+    entries.sort(key=lambda x: x[0], reverse=True)
+    return [d for _, d in entries[:limit]]

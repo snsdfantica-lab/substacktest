@@ -1,0 +1,37 @@
+# List of Substack authors to summarize.
+# `url` accepts either a publication URL (e.g. https://foo.substack.com or a custom domain)
+# or a user-profile URL (e.g. https://substack.com/@handle); profile URLs are
+# resolved to their underlying publication(s) at runtime.
+#
+# `paywalled: true` lets the canary check verify the cookie can still unlock posts.
+# `tickers_focus` is passed to the summary prompt as a hint, not a filter.
+
+- name: photoncap
+  url: https://substack.com/@photoncap/posts
+  paywalled: true
+  tickers_focus: []
+
+- name: jasonschips
+  url: https://substack.com/@jasonschips
+  paywalled: true
+  tickers_focus: []
+
+- name: Crux Capital Group
+  url: https://cruxcapitalgroup.substack.com/
+  paywalled: true
+  tickers_focus: []
+
+- name: damnang2
+  url: https://damnang2.substack.com/
+  paywalled: true
+  tickers_focus: []
+
+- name: BEP Research
+  url: https://bepresearch.substack.com/
+  paywalled: true
+  tickers_focus: []
+
+- name: Chipstrat
+  url: https://www.chipstrat.com/
+  paywalled: true
+  tickers_focus: []

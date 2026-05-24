@@ -1,0 +1,262 @@
+"""Discover and download Substack posts.
+
+Supports two URL forms in authors.yml:
+  - publication URLs:  https://foo.substack.com  or  https://customdomain.com
+  - user-profile URLs: https://substack.com/@handle  (resolved to publication(s))
+
+Listing strategy per publication:
+  1. RSS feed at  <pub>/feed         (up to ~20 most recent)
+  2. Archive JSON at <pub>/api/v1/archive?limit=N  (more, includes paywalled)
+  3. Public archive HTML as last resort.
+
+Authenticated fetch uses the `substack.sid` cookie to unlock paywalled bodies.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Iterable
+from urllib.parse import urlparse, urlunparse
+
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
+
+log = logging.getLogger(__name__)
+
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+TIMEOUT = 30
+
+
+@dataclass
+class Post:
+    author_name: str
+    publication_url: str
+    url: str
+    title: str
+    published_at: str  # ISO 8601
+    html: str = ""
+    raw_excerpt: str = ""
+    is_paywalled: bool | None = None
+    extra: dict = field(default_factory=dict)
+
+
+def _session(cookie: str | None) -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept": "*/*"})
+    if cookie:
+        # The browser cookie name is "substack.sid".
+        s.cookies.set("substack.sid", cookie, domain=".substack.com")
+    return s
+
+
+def _publication_root(url: str) -> str:
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, "", "", "", ""))
+
+
+def resolve_publications(profile_url: str, session: requests.Session) -> list[str]:
+    """Given a https://substack.com/@handle URL, return the publication URLs
+    that handle posts on. Falls back to [profile_url] if resolution fails."""
+    try:
+        r = session.get(profile_url, timeout=TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("could not resolve profile %s: %s", profile_url, e)
+        return []
+    soup = BeautifulSoup(r.text, "lxml")
+    pubs: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        m = re.match(r"https?://([a-z0-9-]+)\.substack\.com/?", href)
+        if m and m.group(1) not in ("substack", "on"):
+            pubs.add(f"https://{m.group(1)}.substack.com")
+    return sorted(pubs)
+
+
+def list_posts_via_rss(pub_url: str, session: requests.Session) -> list[Post]:
+    feed_url = pub_url.rstrip("/") + "/feed"
+    try:
+        r = session.get(feed_url, timeout=TIMEOUT)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.warning("RSS fetch failed for %s: %s", pub_url, e)
+        return []
+    parsed = feedparser.parse(r.content)
+    posts: list[Post] = []
+    for entry in parsed.entries:
+        try:
+            pub_dt = dateparser.parse(entry.get("published") or entry.get("updated") or "")
+            published = pub_dt.isoformat() if pub_dt else ""
+        except (ValueError, TypeError):
+            published = ""
+        posts.append(
+            Post(
+                author_name="",  # filled by caller
+                publication_url=pub_url,
+                url=entry.get("link", ""),
+                title=entry.get("title", "").strip(),
+                published_at=published,
+                raw_excerpt=BeautifulSoup(entry.get("summary", ""), "lxml").get_text(" ", strip=True)[:500],
+            )
+        )
+    return posts
+
+
+def list_posts_via_archive_api(pub_url: str, session: requests.Session, limit: int = 30) -> list[Post]:
+    """Substack exposes an unauthenticated archive listing at
+    /api/v1/archive?sort=new&limit=N — works for most publications."""
+    api = pub_url.rstrip("/") + f"/api/v1/archive?sort=new&limit={limit}"
+    try:
+        r = session.get(api, timeout=TIMEOUT, headers={"Accept": "application/json"})
+        r.raise_for_status()
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.info("archive API unavailable for %s: %s", pub_url, e)
+        return []
+    posts: list[Post] = []
+    for item in data:
+        slug = item.get("slug") or ""
+        url = item.get("canonical_url") or f"{pub_url.rstrip('/')}/p/{slug}"
+        try:
+            pub_dt = dateparser.parse(item.get("post_date") or item.get("publication_date") or "")
+            published = pub_dt.isoformat() if pub_dt else ""
+        except (ValueError, TypeError):
+            published = ""
+        posts.append(
+            Post(
+                author_name="",
+                publication_url=pub_url,
+                url=url,
+                title=(item.get("title") or "").strip(),
+                published_at=published,
+                raw_excerpt=(item.get("description") or "")[:500],
+                is_paywalled=item.get("audience") == "only_paid",
+            )
+        )
+    return posts
+
+
+def list_posts_for_author(
+    name: str,
+    url: str,
+    session: requests.Session,
+    archive_limit: int = 30,
+) -> list[Post]:
+    """Unified listing for a configured author entry, deduped by post URL."""
+    if "substack.com/@" in url:
+        publications = resolve_publications(url, session)
+        if not publications:
+            log.warning("no publications resolved for profile %s", url)
+            return []
+    else:
+        publications = [_publication_root(url)]
+
+    out: dict[str, Post] = {}
+    for pub in publications:
+        # Prefer the archive API (more items, paywall flag).
+        archive_posts = list_posts_via_archive_api(pub, session, limit=archive_limit)
+        for p in archive_posts:
+            p.author_name = name
+            if p.url:
+                out[p.url] = p
+        # RSS catches anything the archive API missed and provides reliable dates.
+        for p in list_posts_via_rss(pub, session):
+            p.author_name = name
+            if p.url and p.url not in out:
+                out[p.url] = p
+    return list(out.values())
+
+
+def fetch_post_html(post: Post, session: requests.Session, retries: int = 3) -> Post:
+    """Download the post HTML using the authenticated session."""
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            r = session.get(post.url, timeout=TIMEOUT)
+            if r.status_code == 200:
+                post.html = r.text
+                return post
+            if r.status_code in (401, 403, 404):
+                log.warning("HTTP %s for %s", r.status_code, post.url)
+                post.html = r.text
+                return post
+            last_err = RuntimeError(f"HTTP {r.status_code}")
+        except requests.RequestException as e:
+            last_err = e
+        time.sleep(2 ** attempt)
+    log.error("giving up on %s: %s", post.url, last_err)
+    return post
+
+
+def get_substack_cookie() -> str | None:
+    """Read the substack.sid cookie from the SUBSTACK_COOKIE env var."""
+    val = os.environ.get("SUBSTACK_COOKIE", "").strip()
+    return val or None
+
+
+def make_session() -> requests.Session:
+    return _session(get_substack_cookie())
+
+
+def discover_new_posts(
+    authors: Iterable[dict],
+    session: requests.Session,
+    seen: dict,
+    since_days: int,
+    authors_filter: set[str] | None = None,
+) -> list[Post]:
+    """For each configured author, list posts and return those not yet seen
+    AND published within the last `since_days` days (or with unknown date)."""
+    from datetime import datetime, timezone, timedelta
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
+    new: list[Post] = []
+    for a in authors:
+        name = a.get("name") or ""
+        if authors_filter and name not in authors_filter:
+            continue
+        url = a.get("url") or ""
+        if not url:
+            continue
+        log.info("listing %s (%s)", name, url)
+        try:
+            posts = list_posts_for_author(name, url, session)
+        except Exception as e:
+            log.exception("listing failed for %s: %s", name, e)
+            continue
+        for p in posts:
+            if p.url in seen:
+                continue
+            if p.published_at:
+                try:
+                    dt = dateparser.parse(p.published_at)
+                    if dt and dt < cutoff:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            new.append(p)
+    return new
+
+
+def canary_check_cookie(session: requests.Session) -> tuple[bool, str]:
+    """Cheap probe: hit substack.com/api/v1/subscriptions and look for an
+    authenticated response. Returns (ok, message). Soft-fail: returns ok=True
+    if the endpoint shape changes, since we'd rather not block the run."""
+    try:
+        r = session.get("https://substack.com/api/v1/subscriptions", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return True, "cookie accepted by substack.com"
+        if r.status_code in (401, 403):
+            return False, f"substack.com returned {r.status_code} — cookie likely expired"
+        return True, f"unexpected status {r.status_code} from canary, continuing"
+    except requests.RequestException as e:
+        return True, f"canary network error ({e}), continuing"
